@@ -14,7 +14,7 @@
             [riemann.instrumentation :refer [Instrumented]])
   (:use [riemann.time :only [unix-time]]
          riemann.service)
-  (:import (org.cliffc.high_scale_lib NonBlockingHashMap)))
+  (:import (org.cliffc.high_scale_lib NonBlockingHashMap) (org.mapdb DBMaker HTreeMap)))
 
 (defprotocol Index
   (clear [this]
@@ -53,7 +53,7 @@
             [(last host) (last service)]))))))
 
 (defn nbhm-index
-  "Create a new nonblockinghashmap backed index"
+  "Create a new NonBlockingHashMap-backed index"
   []
   (let [hm (NonBlockingHashMap.)]
     (reify
@@ -85,6 +85,66 @@
           (let [matching (query/fun query-ast)]
             (filter matching (.values hm)))))
 
+      (update [this event]
+        (if (= "expired" (:state event))
+          (delete this event)
+          (.put hm [(:host event) (:service event)] event)))
+
+      (lookup [this host service]
+        (.get hm [host service]))
+
+      Instrumented
+      (events [this]
+        (let [base {:state "ok" :time (unix-time)}]
+          (map (partial merge base)
+               [{:service "riemann index size"
+                 :metric (.size hm)}])))
+
+      clojure.lang.Seqable
+      (seq [this]
+        (seq (.values hm)))
+
+      ServiceEquiv
+      (equiv? [this other] (= (class this) (class other)))
+
+      Service
+      (conflict? [this other] false)
+      (reload! [this new-core])
+      (start! [this])
+      (stop! [this]))))
+
+(defn mapdb-index
+  "Create a new MapDB-backed index"
+  []
+  (let [hm (. (. (. (. (. DBMaker newMemoryDirectDB) transactionDisable) make) createHashMap "index") make)]
+    (reify
+      Index
+      (clear [this]
+        (.clear hm))
+
+      (delete [this event]
+        (.remove hm [(:host event) (:service event)]))
+
+      (delete-exactly [this event]
+        (.remove hm [(:host event) (:service event)] event))
+
+      (expire [this]
+        (filter
+          (fn [event]
+            (let [age (- (unix-time) (:time event))
+                  ttl (or (:ttl event) default-ttl)]
+              (when (< ttl age)
+                (delete-exactly this event)
+                true)))
+          (.values hm)))
+
+      (search [this query-ast]
+        "O(n) unless the query is for exactly a host and service"
+        (if-let [[host service] (query-for-host-and-service query-ast)]
+          (when-let [e (.lookup this host service)]
+            (list e))
+          (let [matching (query/fun query-ast)]
+            (filter matching (.values hm)))))
 
       (update [this event]
         (if (= "expired" (:state event))
@@ -115,6 +175,6 @@
       (stop! [this]))))
 
 (defn index
-  "Create a new index (currently: an nhbm index)"
+  "Create a new index (currently: MapDB-backed index)"
   []
-  (nbhm-index))
+  (mapdb-index))
